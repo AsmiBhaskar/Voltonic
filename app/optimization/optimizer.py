@@ -1,0 +1,74 @@
+from app.models import db, EnergyLog, Room, Timetable
+from datetime import datetime
+
+class EnergyOptimizer:
+    """Apply optimization rules to reduce energy wastage"""
+    
+    @staticmethod
+    def optimize_room_log(energy_log, room, is_scheduled):
+        """
+        Optimization Rule:
+        IF not scheduled AND occupancy == False:
+            - Set AC to 0
+            - Set lights to minimal (0.05)
+            - Mark as optimized
+        """
+        if not is_scheduled and not energy_log.occupancy:
+            # Calculate baseline (what would have been consumed)
+            baseline_load = energy_log.total_load
+            
+            # Apply optimization
+            energy_log.ac_load = 0.0
+            energy_log.light_load = 0.05
+            
+            # Recalculate total
+            optimized_total = (
+                energy_log.base_load + 
+                energy_log.ac_load + 
+                energy_log.light_load + 
+                energy_log.equipment_load
+            )
+            
+            energy_log.total_load = round(optimized_total, 2)
+            energy_log.optimized = True
+            
+            # Calculate savings
+            energy_saved = round(baseline_load - optimized_total, 2)
+            
+            return energy_saved
+        
+        return 0.0
+    
+    @staticmethod
+    def get_savings_summary(start_time=None, end_time=None):
+        """Calculate total energy savings and environmental impact"""
+        
+        query = EnergyLog.query.filter_by(optimized=True)
+        
+        if start_time:
+            query = query.filter(EnergyLog.timestamp >= start_time)
+        if end_time:
+            query = query.filter(EnergyLog.timestamp <= end_time)
+        
+        optimized_logs = query.all()
+        
+        # Note: We need to calculate savings differently
+        # For now, estimate avg savings per optimized log
+        total_optimized = len(optimized_logs)
+        
+        # Rough estimate: avg 1.5 kW saved per optimization
+        avg_savings_per_optimization = 1.5
+        total_energy_saved_kwh = total_optimized * avg_savings_per_optimization / 60  # Convert to kWh
+        
+        # Financial savings (₹8 per kWh)
+        cost_saved_inr = round(total_energy_saved_kwh * 8, 2)
+        
+        # CO₂ reduction (0.82 kg per kWh)
+        co2_reduced_kg = round(total_energy_saved_kwh * 0.82, 2)
+        
+        return {
+            'total_optimizations': total_optimized,
+            'energy_saved_kwh': round(total_energy_saved_kwh, 2),
+            'cost_saved_inr': cost_saved_inr,
+            'co2_reduced_kg': co2_reduced_kg
+        }
