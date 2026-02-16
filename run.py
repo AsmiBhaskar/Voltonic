@@ -2,7 +2,7 @@ from app import create_app
 from app.models import db, Room, EnergyLog
 from app.utils.seed_data import seed_campus
 from app.simulation.engine import IoTSimulator
-from app.prediction.predictor import EnergyPredictor
+# from app.prediction.predictor import EnergyPredictor  # Temporarily disabled for fast startup
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 import atexit
@@ -11,7 +11,8 @@ import atexit
 app = create_app()
 
 # Global predictor instance
-predictor = EnergyPredictor()
+# predictor = EnergyPredictor()  # Temporarily disabled
+predictor = None
 
 def initialize_database():
     """Check if database needs seeding"""
@@ -35,6 +36,9 @@ def run_simulation_job():
 
 def train_ml_model_job():
     """Scheduled job to retrain ML model daily"""
+    if predictor is None:
+        return  # Skip if predictor not initialized
+    
     with app.app_context():
         try:
             print("\n🤖 Starting scheduled model retraining...")
@@ -44,6 +48,10 @@ def train_ml_model_job():
 
 def check_and_train_initial_model():
     """Train model if enough data exists"""
+    if predictor is None:
+        print("\n⏭️  ML predictor disabled for fast startup\n")
+        return  # Skip if predictor not initialized
+    
     with app.app_context():
         # Check if we have enough data (at least 2 hours of logs)
         cutoff = datetime.now() - timedelta(hours=2)
@@ -71,19 +79,23 @@ def start_simulation_scheduler():
         replace_existing=True
     )
     
-    # Retrain ML model every 24 hours
-    scheduler.add_job(
-        func=train_ml_model_job,
-        trigger="interval",
-        hours=24,
-        id="ml_training",
-        name="ML Model Retraining",
-        replace_existing=True
-    )
+    # Retrain ML model every 24 hours (only if predictor is initialized)
+    if predictor is not None:
+        scheduler.add_job(
+            func=train_ml_model_job,
+            trigger="interval",
+            hours=24,
+            id="ml_training",
+            name="ML Model Retraining",
+            replace_existing=True
+        )
     
     scheduler.start()
     print("🔄 IoT Simulation Scheduler started (60-second interval)")
-    print("🤖 ML Model Retraining scheduled (24-hour interval)")
+    if predictor is not None:
+        print("🤖 ML Model Retraining scheduled (24-hour interval)")
+    else:
+        print("⏭️  ML Model training disabled (uncomment predictor imports to enable)")
     
     # Run first simulation immediately
     run_simulation_job()

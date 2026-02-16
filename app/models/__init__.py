@@ -27,7 +27,7 @@ class Room(db.Model):
     __tablename__ = 'room'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
-    type = db.Column(db.String(20), nullable=False)  # classroom/lab/staff
+    type = db.Column(db.String(20), nullable=False)  # classroom/lab/staff/Smart_Class
     capacity = db.Column(db.Integer, nullable=False)
     base_load_kw = db.Column(db.Float, nullable=False)
     floor_id = db.Column(db.Integer, db.ForeignKey('floor.id'), nullable=False)
@@ -42,10 +42,27 @@ class Timetable(db.Model):
     start_time = db.Column(db.Time, nullable=False)
     end_time = db.Column(db.Time, nullable=False)
 
+class EnergySource(db.Model):
+    __tablename__ = 'energy_source'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False, unique=True)  # grid/solar/diesel
+    cost_per_kwh = db.Column(db.Float, nullable=False)  # Cost in $/kWh
+    is_available = db.Column(db.Boolean, default=True)
+    priority = db.Column(db.Integer, nullable=False)  # 1=highest priority
+    energy_logs = db.relationship('EnergyLog', backref='energy_source', lazy=True)
+
+class GridStatus(db.Model):
+    __tablename__ = 'grid_status'
+    id = db.Column(db.Integer, primary_key=True)
+    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    grid_available = db.Column(db.Boolean, nullable=False, default=True)
+    reason = db.Column(db.String(200))  # Reason for outage if any
+
 class EnergyLog(db.Model):
     __tablename__ = 'energy_log'
     id = db.Column(db.Integer, primary_key=True)
     room_id = db.Column(db.Integer, db.ForeignKey('room.id'), nullable=False, index=True)
+    energy_source_id = db.Column(db.Integer, db.ForeignKey('energy_source.id'), nullable=False, index=True)
     timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
     occupancy = db.Column(db.Boolean, nullable=False)
     temperature = db.Column(db.Float, nullable=False)

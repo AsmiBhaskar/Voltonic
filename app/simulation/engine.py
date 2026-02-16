@@ -1,10 +1,53 @@
 import random
 from datetime import datetime
-from app.models import db, Room, Timetable, EnergyLog
+from app.models import db, Room, Timetable, EnergyLog, EnergySource, GridStatus
 from app.optimization.optimizer import EnergyOptimizer
 
 class IoTSimulator:
     """Simulates IoT sensor data for all rooms every 60 seconds"""
+    
+    @staticmethod
+    def get_grid_status():
+        """Get current grid availability status"""
+        latest_status = GridStatus.query.order_by(GridStatus.timestamp.desc()).first()
+        if latest_status:
+            return latest_status.grid_available
+        return True  # Default to grid available
+    
+    @staticmethod
+    def select_energy_source(room_type, grid_available):
+        """Select appropriate energy source based on grid status and room type
+        
+        Logic:
+        - Grid available -> Use grid for all rooms
+        - Grid down:
+            - classroom/staff -> Use solar+battery
+            - lab/Smart_Class -> Use diesel generator
+        """
+        sources = {src.name: src for src in EnergySource.query.all()}
+        
+        # If no energy sources exist yet, return None (will be handled by caller)
+        if not sources:
+            return None
+        
+        if grid_available:
+            # Grid is primary source when available
+            grid_source = sources.get('grid')
+            return grid_source.id if grid_source else None
+        else:
+            # Grid is down - use backup sources
+            if room_type in ['classroom', 'staff']:
+                # Use solar+battery for classrooms and staff rooms
+                solar_source = sources.get('solar')
+                return solar_source.id if solar_source else None
+            elif room_type in ['lab', 'Smart_Class']:
+                # Use diesel generator for labs and Smart_Class
+                diesel_source = sources.get('diesel')
+                return diesel_source.id if diesel_source else None
+        
+        # Fallback to grid
+        grid_source = sources.get('grid')
+        return grid_source.id if grid_source else None
     
     @staticmethod
     def is_room_scheduled(room_id, current_time):
@@ -38,6 +81,8 @@ class IoTSimulator:
         # Equipment Load
         if room.type == "classroom":
             equipment_load = round(random.uniform(0.2, 0.5), 2) if is_scheduled else 0.1
+        elif room.type == "Smart_Class":
+            equipment_load = round(random.uniform(3.0, 4.5), 2) if is_scheduled else 0.5
         elif room.type == "lab":
             equipment_load = round(random.uniform(2.5, 4.0), 2) if is_scheduled else 0.3
         else:  # staff room
@@ -70,9 +115,12 @@ class IoTSimulator:
     
     @staticmethod
     def simulate_all_rooms():
-        """Run simulation for all 1260 rooms with optimization"""
+        """Run simulation for all rooms with optimization and energy source selection"""
         current_time = datetime.now()
         rooms = Room.query.all()
+        
+        # Get current grid status
+        grid_available = IoTSimulator.get_grid_status()
         
         logs_created = 0
         optimizations_applied = 0
@@ -87,15 +135,23 @@ class IoTSimulator:
             # Calculate loads
             load_data = IoTSimulator.calculate_loads(room, is_scheduled, temperature)
             
+            # Select appropriate energy source
+            energy_source_id = IoTSimulator.select_energy_source(room.type, grid_available)
+            
+            # Skip if energy sources not initialized yet
+            if energy_source_id is None:
+                continue
+            
             # Create energy log
             energy_log = EnergyLog(
                 room_id=room.id,
+                energy_source_id=energy_source_id,
                 timestamp=current_time,
                 **load_data
             )
             
             # Apply optimization
-            savings = EnergyOptimizer.optimize_room_log(energy_log, room, is_scheduled)
+            EnergyOptimizer.optimize_room_log(energy_log, room, is_scheduled)
             if energy_log.optimized:
                 optimizations_applied += 1
             
