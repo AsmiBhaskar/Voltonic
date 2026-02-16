@@ -1,14 +1,15 @@
 from flask import jsonify, request
 from datetime import datetime, timedelta
 from app.api import api_bp
-from app.models import db, Room, Building, Floor, Faculty, EnergyLog, Timetable
+from app.models import db, Room, Building, Floor, Faculty, EnergyLog, Timetable, EnergySource, GridStatus
 from app.analytics.analytics import EnergyAnalytics
 from app.optimization.optimizer import EnergyOptimizer
-from app.prediction.predictor import EnergyPredictor
+# from app.prediction.predictor import EnergyPredictor  # Temporarily disabled for fast startup
 from app.simulation.engine import IoTSimulator
 
 # Initialize predictor
-predictor = EnergyPredictor()
+# predictor = EnergyPredictor()  # Temporarily disabled
+predictor = None  # Will add back later
 
 # ============================================================================
 # DASHBOARD & LIVE DATA ENDPOINTS
@@ -168,6 +169,9 @@ def get_optimization_status():
 def predict_next_hour():
     """Predict energy consumption for next hour"""
     try:
+        if predictor is None:
+            return jsonify({'status': 'error', 'message': 'ML predictor not initialized'}), 503
+        
         # Load model if not already loaded
         if not predictor.is_trained:
             predictor.load_model()
@@ -186,6 +190,9 @@ def predict_next_hour():
 def train_prediction_model():
     """Manually trigger model training"""
     try:
+        if predictor is None:
+            return jsonify({'status': 'error', 'message': 'ML predictor not initialized'}), 503
+        
         hours_back = request.json.get('hours_back', 168) if request.json else 168
         
         success, result = predictor.train_model(hours_back=hours_back)
@@ -202,6 +209,9 @@ def train_prediction_model():
 def get_model_info():
     """Get ML model information and feature importance"""
     try:
+        if predictor is None:
+            return jsonify({'status': 'error', 'message': 'ML predictor not initialized'}), 503
+        
         if not predictor.is_trained:
             if not predictor.load_model():
                 return jsonify({'status': 'error', 'message': 'Model not trained'}), 404
@@ -384,6 +394,383 @@ def get_room_details(room_id):
 
 
 # ============================================================================
+# BUILDING & ROOM MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@api_bp.route('/buildings', methods=['GET'])
+def get_all_buildings():
+    """Get all buildings with their structure"""
+    try:
+        buildings = Building.query.all()
+        buildings_data = []
+        
+        for building in buildings:
+            floors_data = []
+            for floor in building.floors:
+                rooms_by_type = {}
+                for room in floor.rooms:
+                    if room.type not in rooms_by_type:
+                        rooms_by_type[room.type] = 0
+                    rooms_by_type[room.type] += 1
+                
+                floors_data.append({
+                    'id': floor.id,
+                    'number': floor.number,
+                    'total_rooms': len(floor.rooms),
+                    'rooms_by_type': rooms_by_type
+                })
+            
+            buildings_data.append({
+                'id': building.id,
+                'name': building.name,
+                'faculty_id': building.faculty_id,
+                'faculty_name': building.faculty.name,
+                'total_floors': len(building.floors),
+                'total_rooms': sum(len(floor.rooms) for floor in building.floors),
+                'floors': floors_data
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'data': buildings_data
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/buildings/<int:building_id>/energy-flow', methods=['GET'])
+def get_building_energy_flow(building_id):
+    """Get real-time energy flow visualization for a building"""
+    try:
+        building = Building.query.get_or_404(building_id)
+        
+        # Get latest energy logs for all rooms in this building
+        latest_time = db.session.query(db.func.max(EnergyLog.timestamp)).scalar()
+        if not latest_time:
+            return jsonify({'status': 'error', 'message': 'No energy data available'}), 404
+        
+        floors_data = []
+        for floor in building.floors:
+            rooms_data = []
+            for room in floor.rooms:
+                # Get latest log for this room
+                latest_log = EnergyLog.query.filter_by(
+                    room_id=room.id,
+                    timestamp=latest_time
+                ).first()
+                
+                if latest_log:
+                    rooms_data.append({
+                        'room_id': room.id,
+                        'room_name': room.name,
+                        'room_type': room.type,
+                        'capacity': room.capacity,
+                        'occupancy': latest_log.occupancy,
+                        'total_load': latest_log.total_load,
+                        'energy_source': latest_log.energy_source.name,
+                        'energy_source_cost': latest_log.energy_source.cost_per_kwh,
+                        'optimized': latest_log.optimized
+                    })
+            
+            floors_data.append({
+                'floor_id': floor.id,
+                'floor_number': floor.number,
+                'total_load': sum(r['total_load'] for r in rooms_data),
+                'rooms': rooms_data
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'building_id': building.id,
+                'building_name': building.name,
+                'timestamp': latest_time.isoformat(),
+                'total_load': sum(f['total_load'] for f in floors_data),
+                'floors': floors_data
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/rooms', methods=['POST'])
+def create_room():
+    """Create a new room
+    
+    Request body:
+    {
+        "name": "ENG-B1-F1-C31",
+        "type": "classroom",
+        "capacity": 50,
+        "base_load_kw": 0.5,
+        "floor_id": 1
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        required = ['name', 'type', 'capacity', 'base_load_kw', 'floor_id']
+        if not all(field in data for field in required):
+            return jsonify({
+                'status': 'error',
+                'message': f'Missing required fields: {required}'
+            }), 400
+        
+        # Validate room type
+        valid_types = ['classroom', 'lab', 'staff', 'Smart_Class']
+        if data['type'] not in valid_types:
+            return jsonify({
+                'status': 'error',
+                'message': f'Invalid room type. Must be one of: {valid_types}'
+            }), 400
+        
+        room = Room(
+            name=data['name'],
+            type=data['type'],
+            capacity=data['capacity'],
+            base_load_kw=data['base_load_kw'],
+            floor_id=data['floor_id']
+        )
+        
+        db.session.add(room)
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Room created successfully',
+            'data': {
+                'id': room.id,
+                'name': room.name,
+                'type': room.type,
+                'capacity': room.capacity,
+                'base_load_kw': room.base_load_kw,
+                'floor_id': room.floor_id
+            }
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/rooms/<int:room_id>', methods=['PUT'])
+def update_room(room_id):
+    """Update room details"""
+    try:
+        room = Room.query.get_or_404(room_id)
+        data = request.get_json()
+        
+        if 'name' in data:
+            room.name = data['name']
+        if 'type' in data:
+            valid_types = ['classroom', 'lab', 'staff', 'Smart_Class']
+            if data['type'] not in valid_types:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Invalid room type. Must be one of: {valid_types}'
+                }), 400
+            room.type = data['type']
+        if 'capacity' in data:
+            room.capacity = data['capacity']
+        if 'base_load_kw' in data:
+            room.base_load_kw = data['base_load_kw']
+        
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Room updated successfully',
+            'data': {
+                'id': room.id,
+                'name': room.name,
+                'type': room.type,
+                'capacity': room.capacity,
+                'base_load_kw': room.base_load_kw
+            }
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/rooms/<int:room_id>', methods=['DELETE'])
+def delete_room(room_id):
+    """Delete a room"""
+    try:
+        room = Room.query.get_or_404(room_id)
+        room_name = room.name
+        
+        db.session.delete(room)
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Room {room_name} deleted successfully'
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/floors', methods=['POST'])
+def create_floor():
+    """Create a new floor
+    
+    Request body:
+    {
+        "number": 4,
+        "building_id": 1
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if 'number' not in data or 'building_id' not in data:
+            return jsonify({
+                'status': 'error',
+                'message': 'number and building_id are required'
+            }), 400
+        
+        floor = Floor(
+            number=data['number'],
+            building_id=data['building_id']
+        )
+        
+        db.session.add(floor)
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Floor created successfully',
+            'data': {
+                'id': floor.id,
+                'number': floor.number,
+                'building_id': floor.building_id
+            }
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/buildings', methods=['POST'])
+def create_building():
+    """Create a new building
+    
+    Request body:
+    {
+        "name": "ENG-B4",
+        "faculty_id": 1
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if 'name' not in data or 'faculty_id' not in data:
+            return jsonify({
+                'status': 'error',
+                'message': 'name and faculty_id are required'
+            }), 400
+        
+        building = Building(
+            name=data['name'],
+            faculty_id=data['faculty_id']
+        )
+        
+        db.session.add(building)
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Building created successfully',
+            'data': {
+                'id': building.id,
+                'name': building.name,
+                'faculty_id': building.faculty_id
+            }
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/rooms/<int:room_id>/power-control', methods=['POST'])
+def control_room_power(room_id):
+    """Manual power control for a specific room
+    
+    Request body:
+    {
+        "action": "increase" | "decrease" | "set",
+        "value": 1.5  (for 'set' action, kW value)
+    }
+    """
+    try:
+        room = Room.query.get_or_404(room_id)
+        data = request.get_json()
+        
+        if 'action' not in data:
+            return jsonify({
+                'status': 'error',
+                'message': 'action is required'
+            }), 400
+        
+        action = data['action']
+        current_load = room.base_load_kw
+        
+        if action == 'increase':
+            new_load = round(current_load + 0.5, 2)
+        elif action == 'decrease':
+            new_load = max(0.1, round(current_load - 0.5, 2))
+        elif action == 'set':
+            if 'value' not in data:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'value is required for set action'
+                }), 400
+            new_load = round(data['value'], 2)
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'action must be: increase, decrease, or set'
+            }), 400
+        
+        room.base_load_kw = new_load
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Power adjusted for {room.name}',
+            'data': {
+                'room_id': room.id,
+                'room_name': room.name,
+                'previous_load_kw': current_load,
+                'new_load_kw': new_load
+            }
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/faculties', methods=['GET'])
+def get_all_faculties():
+    """Get all faculties"""
+    try:
+        faculties = Faculty.query.all()
+        faculties_data = [{
+            'id': f.id,
+            'name': f.name,
+            'total_buildings': len(f.buildings)
+        } for f in faculties]
+        
+        return jsonify({
+            'status': 'success',
+            'data': faculties_data
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# ============================================================================
 # HISTORICAL DATA ENDPOINTS
 # ============================================================================
 
@@ -496,6 +883,157 @@ def get_statistics_summary():
 
 
 # ============================================================================
+# ENERGY SOURCES & GRID MANAGEMENT
+# ============================================================================
+
+@api_bp.route('/energy-sources', methods=['GET'])
+def get_energy_sources():
+    """Get all energy sources with their costs and availability"""
+    try:
+        sources = EnergySource.query.order_by(EnergySource.priority).all()
+        
+        sources_data = [{
+            'id': src.id,
+            'name': src.name,
+            'cost_per_kwh': src.cost_per_kwh,
+            'is_available': src.is_available,
+            'priority': src.priority
+        } for src in sources]
+        
+        return jsonify({
+            'status': 'success',
+            'data': sources_data
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/grid-status', methods=['GET'])
+def get_grid_status():
+    """Get current grid status"""
+    try:
+        latest_status = GridStatus.query.order_by(GridStatus.timestamp.desc()).first()
+        
+        if not latest_status:
+            return jsonify({
+                'status': 'success',
+                'data': {
+                    'grid_available': True,
+                    'timestamp': datetime.now().isoformat(),
+                    'reason': None
+                }
+            }), 200
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'grid_available': latest_status.grid_available,
+                'timestamp': latest_status.timestamp.isoformat(),
+                'reason': latest_status.reason
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/grid-status', methods=['POST'])
+def update_grid_status():
+    """Update grid status (simulate power outage or restoration)
+    
+    Request body:
+    {
+        "grid_available": true/false,
+        "reason": "Power outage in sector 5" (optional)
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if 'grid_available' not in data:
+            return jsonify({
+                'status': 'error',
+                'message': 'grid_available is required'
+            }), 400
+        
+        grid_status = GridStatus(
+            timestamp=datetime.now(),
+            grid_available=data['grid_available'],
+            reason=data.get('reason')
+        )
+        
+        db.session.add(grid_status)
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'message': f"Grid status updated to {'online' if data['grid_available'] else 'offline'}",
+            'data': {
+                'grid_available': grid_status.grid_available,
+                'timestamp': grid_status.timestamp.isoformat(),
+                'reason': grid_status.reason
+            }
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/energy-cost-breakdown', methods=['GET'])
+def get_energy_cost_breakdown():
+    """Get energy consumption and cost breakdown by source
+    
+    Query params:
+    - hours: Number of hours to look back (default: 24)
+    """
+    try:
+        hours = request.args.get('hours', 24, type=int)
+        since = datetime.now() - timedelta(hours=hours)
+        
+        # Get all logs with energy source info
+        logs = db.session.query(
+            EnergySource.name,
+            EnergySource.cost_per_kwh,
+            db.func.sum(EnergyLog.total_load).label('total_kwh'),
+            db.func.count(EnergyLog.id).label('log_count')
+        ).join(
+            EnergyLog, EnergyLog.energy_source_id == EnergySource.id
+        ).filter(
+            EnergyLog.timestamp >= since
+        ).group_by(
+            EnergySource.id, EnergySource.name, EnergySource.cost_per_kwh
+        ).all()
+        
+        breakdown = []
+        total_cost = 0
+        total_kwh = 0
+        
+        for log in logs:
+            cost = log.total_kwh * log.cost_per_kwh
+            total_cost += cost
+            total_kwh += log.total_kwh
+            
+            breakdown.append({
+                'source': log.name,
+                'cost_per_kwh': log.cost_per_kwh,
+                'total_kwh': round(log.total_kwh, 2),
+                'total_cost': round(cost, 2),
+                'log_count': log.log_count
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'period_hours': hours,
+                'total_cost': round(total_cost, 2),
+                'total_kwh': round(total_kwh, 2),
+                'breakdown': breakdown
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# ============================================================================
 # HEALTH CHECK
 # ============================================================================
 
@@ -510,6 +1048,8 @@ def health_check():
         room_count = Room.query.count()
         log_count = EnergyLog.query.count()
         
+        ml_status = 'not_initialized' if predictor is None else ('loaded' if predictor.is_trained else 'not_trained')
+        
         return jsonify({
             'status': 'healthy',
             'timestamp': datetime.now().isoformat(),
@@ -517,7 +1057,7 @@ def health_check():
             'rooms': room_count,
             'logs': log_count,
             'simulation': 'running',
-            'ml_model': 'loaded' if predictor.is_trained else 'not_trained'
+            'ml_model': ml_status
         }), 200
     except Exception as e:
         return jsonify({

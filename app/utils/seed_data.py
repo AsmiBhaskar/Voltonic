@@ -1,11 +1,56 @@
 import random
-from datetime import time
-from app.models import db, Faculty, Building, Floor, Room, Timetable
+from datetime import time, datetime
+from app.models import db, Faculty, Building, Floor, Room, Timetable, EnergySource, GridStatus
+
+def seed_energy_sources():
+    """Initialize energy sources with pricing"""
+    print(" Seeding energy sources...")
+    
+    # Grid electricity - primary source
+    grid = EnergySource(
+        name="grid",
+        cost_per_kwh=1.0,  # $1/kWh
+        is_available=True,
+        priority=1
+    )
+    db.session.add(grid)
+    
+    # Solar + Battery - backup for classrooms/staff
+    solar = EnergySource(
+        name="solar",
+        cost_per_kwh=0.5,  # $0.5/kWh
+        is_available=True,
+        priority=2
+    )
+    db.session.add(solar)
+    
+    # Diesel Generator - backup for labs/Smart_Class
+    diesel = EnergySource(
+        name="diesel",
+        cost_per_kwh=2.0,  # $2/kWh
+        is_available=True,
+        priority=3
+    )
+    db.session.add(diesel)
+    
+    # Initialize grid status as online
+    grid_status = GridStatus(
+        timestamp=datetime.utcnow(),
+        grid_available=True,
+        reason=None
+    )
+    db.session.add(grid_status)
+    
+    db.session.commit()
+    print(f"   Created 3 energy sources: grid ($1/kWh), solar ($0.5/kWh), diesel ($2/kWh)")
 
 def seed_campus():
-    """Generate complete campus structure with 1260 rooms"""
+    """Generate complete campus structure with rooms and Smart_Classes"""
     
     print(" Seeding campus data...")
+    
+    # First, seed energy sources
+    seed_energy_sources()
     
     # Faculty names
     faculty_names = [
@@ -75,6 +120,18 @@ def seed_campus():
                     db.session.add(room)
                     db.session.flush()
                     create_timetable(room.id, "staff")
+                
+                # 1 Smart Class (high-tech classroom)
+                room = Room(
+                    name=f"{building.name}-F{floor_num}-SC1",
+                    type="Smart_Class",
+                    capacity=random.randint(50, 80),
+                    base_load_kw=round(random.uniform(1.5, 2.5), 2),
+                    floor_id=floor.id
+                )
+                db.session.add(room)
+                db.session.flush()
+                create_timetable(room.id, "Smart_Class")
     
     db.session.commit()
     
@@ -96,6 +153,15 @@ def create_timetable(room_id, room_type):
             (10, 45, 12, 15), # 10:45 AM - 12:15 PM
             (13, 30, 15, 0),  # 1:30 PM - 3:00 PM
             (15, 15, 16, 45)  # 3:15 PM - 4:45 PM
+        ]
+        days = [0, 1, 2, 3, 4]  # Monday to Friday
+        
+    elif room_type == "Smart_Class":
+        # Smart Classes: Mon-Fri, premium time slots
+        schedules = [
+            (9, 0, 11, 0),   # 9:00 AM - 11:00 AM
+            (11, 30, 13, 30), # 11:30 AM - 1:30 PM
+            (14, 0, 16, 0)   # 2:00 PM - 4:00 PM
         ]
         days = [0, 1, 2, 3, 4]  # Monday to Friday
         
