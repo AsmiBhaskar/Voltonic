@@ -1,4 +1,4 @@
-from app.models import db, EnergyLog, Room, Timetable
+from app.models import db, EnergyLog, Room, Timetable, EnergySource
 from datetime import datetime
 
 class EnergyOptimizer:
@@ -7,12 +7,34 @@ class EnergyOptimizer:
     @staticmethod
     def optimize_room_log(energy_log, room, is_scheduled):
         """
-        Optimization Rule:
-        IF not scheduled AND occupancy == False:
+        Optimization Rules:
+        
+        Rule 1: Peak Solar Hours (10 AM - 3 PM)
+        - Switch classroom and Smart_Class from grid to solar
+        - Mark as optimized
+        
+        Rule 2: Unoccupied Rooms
+        - IF not scheduled AND occupancy == False:
             - Set AC to 0
             - Set lights to minimal (0.05)
             - Mark as optimized
         """
+        optimized = False
+        
+        # Rule 1: Solar Energy Optimization (10 AM - 3 PM)
+        current_hour = energy_log.timestamp.hour
+        if 10 <= current_hour < 15:  # 10 AM to 3 PM (before 3 PM)
+            if room.type in ['classroom', 'Smart_Class']:
+                # Get solar energy source
+                solar_source = EnergySource.query.filter_by(name='solar').first()
+                grid_source = EnergySource.query.filter_by(name='grid').first()
+                
+                # Switch from grid to solar if currently on grid
+                if solar_source and grid_source and energy_log.energy_source_id == grid_source.id:
+                    energy_log.energy_source_id = solar_source.id
+                    optimized = True
+        
+        # Rule 2: Unoccupied Room Optimization
         if not is_scheduled and not energy_log.occupancy:
             # Calculate baseline (what would have been consumed)
             baseline_load = energy_log.total_load
@@ -30,12 +52,14 @@ class EnergyOptimizer:
             )
             
             energy_log.total_load = round(optimized_total, 2)
-            energy_log.optimized = True
+            optimized = True
             
             # Calculate savings
             energy_saved = round(baseline_load - optimized_total, 2)
-            
-            return energy_saved
+        
+        # Mark the log as optimized if any rule was applied
+        if optimized:
+            energy_log.optimized = True
         
         return 0.0
     

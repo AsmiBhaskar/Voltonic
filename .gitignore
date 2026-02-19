@@ -2,3 +2,5 @@ venv/
 .venv/
 prediction_test_report.json
 instance/
+__pycache__/
+*.pyc
