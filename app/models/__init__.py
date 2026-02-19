@@ -72,3 +72,63 @@ class EnergyLog(db.Model):
     equipment_load = db.Column(db.Float, nullable=False)
     total_load = db.Column(db.Float, nullable=False)
     optimized = db.Column(db.Boolean, default=False)
+
+
+class AutonomousLog(db.Model):
+    """Logs all autonomous system actions for audit and analytics"""
+    __tablename__ = 'autonomous_log'
+    id = db.Column(db.Integer, primary_key=True)
+    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    action_type = db.Column(db.String(50), nullable=False, index=True)
+    # Action types: 
+    # - POWER_CUTOFF: Auto power cut due to predicted cancellation
+    # - SOURCE_SWITCH: Switched energy source (solar->grid, etc.)
+    # - HYBRID_MODE: Activated hybrid power mode
+    # - DEMAND_SPIKE: Detected demand spike
+    # - PREDICTIVE_SWITCH: Proactive source switch based on ML prediction
+    room_id = db.Column(db.Integer, db.ForeignKey('room.id'), nullable=True, index=True)
+    building_id = db.Column(db.Integer, db.ForeignKey('building.id'), nullable=True)
+    reason = db.Column(db.String(500), nullable=False)
+    energy_saved_kwh = db.Column(db.Float, default=0.0)
+    previous_state = db.Column(db.String(200))  # JSON string of previous state
+    new_state = db.Column(db.String(200))  # JSON string of new state
+    is_optimization = db.Column(db.Boolean, default=True)
+    confidence_score = db.Column(db.Float)  # ML prediction confidence (0-1)
+    
+    room = db.relationship('Room', backref='autonomous_logs')
+    building = db.relationship('Building', backref='autonomous_logs')
+
+
+class CancellationPattern(db.Model):
+    """Tracks class cancellation patterns for ML predictions"""
+    __tablename__ = 'cancellation_pattern'
+    id = db.Column(db.Integer, primary_key=True)
+    room_id = db.Column(db.Integer, db.ForeignKey('room.id'), nullable=False, index=True)
+    day_of_week = db.Column(db.Integer, nullable=False)  # 0-6
+    hour = db.Column(db.Integer, nullable=False)  # 0-23
+    scheduled_count = db.Column(db.Integer, default=0)  # Times scheduled
+    occupied_count = db.Column(db.Integer, default=0)  # Times actually occupied
+    cancellation_rate = db.Column(db.Float, default=0.0)  # occupied/scheduled
+    last_updated = db.Column(db.DateTime, default=datetime.utcnow)
+    auto_cutoff_enabled = db.Column(db.Boolean, default=False)  # If >50% cancellation
+    
+    room = db.relationship('Room', backref='cancellation_patterns')
+    
+    __table_args__ = (
+        db.UniqueConstraint('room_id', 'day_of_week', 'hour', name='unique_room_day_hour'),
+    )
+
+
+class PowerSourceConfig(db.Model):
+    """Configuration for smart power source management"""
+    __tablename__ = 'power_source_config'
+    id = db.Column(db.Integer, primary_key=True)
+    building_id = db.Column(db.Integer, db.ForeignKey('building.id'), nullable=False, unique=True)
+    solar_capacity_kw = db.Column(db.Float, default=452.0)  # Max solar capacity
+    current_solar_output_kw = db.Column(db.Float, default=0.0)
+    grid_capacity_kw = db.Column(db.Float, default=1000.0)  # Max grid capacity
+    demand_spike_threshold_kw = db.Column(db.Float, default=2.0)  # Threshold for spike
+    hybrid_mode_active = db.Column(db.Boolean, default=False)
+    last_source_switch = db.Column(db.DateTime)
+    
+    building = db.relationship('Building', backref='power_config')

@@ -9,8 +9,8 @@ function PredictionCard() {
   useEffect(() => {
     fetchPrediction();
 
-    // Refresh prediction every 5 seconds
-    const interval = setInterval(fetchPrediction, 5000);
+    // Refresh prediction every 10 minutes (matches backend cache TTL)
+    const interval = setInterval(fetchPrediction, 600000); // 10 minutes
 
     return () => clearInterval(interval);
   }, []);

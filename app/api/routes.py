@@ -1,15 +1,20 @@
 from flask import jsonify, request
 from datetime import datetime, timedelta
 from app.api import api_bp
-from app.models import db, Room, Building, Floor, Faculty, EnergyLog, Timetable, EnergySource, GridStatus
+from app.models import (
+    db, Room, Building, Floor, Faculty, EnergyLog, Timetable, EnergySource, GridStatus,
+    AutonomousLog, CancellationPattern, PowerSourceConfig
+)
 from app.analytics.analytics import EnergyAnalytics
 from app.optimization.optimizer import EnergyOptimizer
-# from app.prediction.predictor import EnergyPredictor  # Temporarily disabled for fast startup
+from app.optimization.smart_power_controller import SmartPowerController
+from app.prediction.predictor import EnergyPredictor
 from app.simulation.engine import IoTSimulator
+from app.utils.rate_limiter import rate_limit
+from app.utils.prediction_cache import prediction_cache
 
 # Initialize predictor
-# predictor = EnergyPredictor()  # Temporarily disabled
-predictor = None  # Will add back later
+predictor = EnergyPredictor()
 
 # ============================================================================
 # DASHBOARD & LIVE DATA ENDPOINTS
@@ -166,11 +171,18 @@ def get_optimization_status():
 # ============================================================================
 
 @api_bp.route('/prediction/next-hour', methods=['GET'])
+@rate_limit(max_requests=10, window_seconds=60)
 def predict_next_hour():
-    """Predict energy consumption for next hour"""
+    """Predict energy consumption for next hour (cached for 10 minutes)"""
     try:
-        if predictor is None:
-            return jsonify({'status': 'error', 'message': 'ML predictor not initialized'}), 503
+        # Check cache first
+        cached_prediction = prediction_cache.get('next_hour_prediction')
+        if cached_prediction:
+            return jsonify({
+                'status': 'success', 
+                'data': cached_prediction,
+                'cached': True
+            }), 200
         
         # Load model if not already loaded
         if not predictor.is_trained:
@@ -181,18 +193,23 @@ def predict_next_hour():
         if error:
             return jsonify({'status': 'error', 'message': error}), 400
         
-        return jsonify({'status': 'success', 'data': prediction}), 200
+        # Cache the prediction
+        prediction_cache.set(prediction, 'next_hour_prediction')
+        
+        return jsonify({
+            'status': 'success', 
+            'data': prediction,
+            'cached': False
+        }), 200
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @api_bp.route('/prediction/train', methods=['POST'])
+@rate_limit(max_requests=5, window_seconds=60)
 def train_prediction_model():
-    """Manually trigger model training"""
+    """Manually trigger model training (rate limited to prevent abuse)"""
     try:
-        if predictor is None:
-            return jsonify({'status': 'error', 'message': 'ML predictor not initialized'}), 503
-        
         hours_back = request.json.get('hours_back', 168) if request.json else 168
         
         success, result = predictor.train_model(hours_back=hours_back)
@@ -200,18 +217,19 @@ def train_prediction_model():
         if not success:
             return jsonify({'status': 'error', 'message': result}), 400
         
+        # Clear prediction cache after retraining
+        prediction_cache.clear('next_hour_prediction')
+        
         return jsonify({'status': 'success', 'data': result}), 200
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @api_bp.route('/prediction/model-info', methods=['GET'])
+@rate_limit(max_requests=10, window_seconds=60)
 def get_model_info():
     """Get ML model information and feature importance"""
     try:
-        if predictor is None:
-            return jsonify({'status': 'error', 'message': 'ML predictor not initialized'}), 503
-        
         if not predictor.is_trained:
             if not predictor.load_model():
                 return jsonify({'status': 'error', 'message': 'Model not trained'}), 404
@@ -221,12 +239,16 @@ def get_model_info():
         if error:
             return jsonify({'status': 'error', 'message': error}), 400
         
+        # Get cache info
+        cache_info = prediction_cache.get_cache_info()
+        
         return jsonify({
             'status': 'success',
             'data': {
                 'is_trained': predictor.is_trained,
                 'model_type': 'RandomForestRegressor',
-                'feature_importance': feature_importance
+                'feature_importance': feature_importance,
+                'cache_info': cache_info
             }
         }), 200
     except Exception as e:
@@ -1060,6 +1082,308 @@ def get_energy_cost_breakdown():
 
 
 # ============================================================================
+# AUTONOMOUS ACTIVITY & SMART POWER ENDPOINTS
+# ============================================================================
+
+@api_bp.route('/autonomous/logs', methods=['GET'])
+@rate_limit(max_requests=20, window_seconds=60)
+def get_autonomous_logs():
+    """Get autonomous system activity logs
+    
+    Query params:
+    - hours: Number of hours to look back (default: 24)
+    - action_type: Filter by action type (optional)
+    - room_id: Filter by room (optional)
+    - building_id: Filter by building (optional)
+    """
+    try:
+        hours = request.args.get('hours', default=24, type=int)
+        action_type = request.args.get('action_type')
+        room_id = request.args.get('room_id', type=int)
+        building_id = request.args.get('building_id', type=int)
+        
+        cutoff = datetime.now() - timedelta(hours=hours)
+        
+        query = AutonomousLog.query.filter(AutonomousLog.timestamp >= cutoff)
+        
+        if action_type:
+            query = query.filter(AutonomousLog.action_type == action_type)
+        if room_id:
+            query = query.filter(AutonomousLog.room_id == room_id)
+        if building_id:
+            query = query.filter(AutonomousLog.building_id == building_id)
+        
+        logs = query.order_by(AutonomousLog.timestamp.desc()).limit(200).all()
+        
+        result = []
+        for log in logs:
+            room_name = None
+            building_name = None
+            
+            if log.room:
+                room_name = log.room.name
+            if log.building:
+                building_name = log.building.name
+            
+            result.append({
+                'id': log.id,
+                'timestamp': log.timestamp.isoformat(),
+                'action_type': log.action_type,
+                'room_id': log.room_id,
+                'room_name': room_name,
+                'building_id': log.building_id,
+                'building_name': building_name,
+                'reason': log.reason,
+                'energy_saved_kwh': log.energy_saved_kwh,
+                'is_optimization': log.is_optimization,
+                'confidence_score': log.confidence_score
+            })
+        
+        # Summary stats
+        total_energy_saved = sum(log.energy_saved_kwh or 0 for log in logs)
+        action_counts = {}
+        for log in logs:
+            action_counts[log.action_type] = action_counts.get(log.action_type, 0) + 1
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'logs': result,
+                'summary': {
+                    'total_actions': len(logs),
+                    'total_energy_saved_kwh': round(total_energy_saved, 3),
+                    'action_counts': action_counts,
+                    'period_hours': hours
+                }
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/autonomous/risky-schedules', methods=['GET'])
+@rate_limit(max_requests=10, window_seconds=60)
+def get_risky_schedules():
+    """Get schedules with high cancellation rates (>50%)"""
+    try:
+        min_rate = request.args.get('min_rate', default=0.5, type=float)
+        risky_schedules = SmartPowerController.get_risky_schedules(min_rate)
+        
+        # Group by room
+        rooms_summary = {}
+        for schedule in risky_schedules:
+            room_id = schedule['room_id']
+            if room_id not in rooms_summary:
+                rooms_summary[room_id] = {
+                    'room_id': room_id,
+                    'room_name': schedule['room_name'],
+                    'room_type': schedule['room_type'],
+                    'high_risk_slots': [],
+                    'avg_cancellation_rate': 0
+                }
+            rooms_summary[room_id]['high_risk_slots'].append({
+                'day_of_week': schedule['day_of_week'],
+                'hour': schedule['hour'],
+                'cancellation_rate': schedule['cancellation_rate'],
+                'auto_cutoff_enabled': schedule['auto_cutoff_enabled']
+            })
+        
+        # Calculate averages
+        for room_id, data in rooms_summary.items():
+            rates = [slot['cancellation_rate'] for slot in data['high_risk_slots']]
+            data['avg_cancellation_rate'] = round(sum(rates) / len(rates), 1) if rates else 0
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'risky_schedules': risky_schedules,
+                'rooms_summary': list(rooms_summary.values()),
+                'total_risky_slots': len(risky_schedules),
+                'rooms_affected': len(rooms_summary)
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/autonomous/prediction-accuracy', methods=['GET'])
+@rate_limit(max_requests=10, window_seconds=60)
+def get_prediction_accuracy():
+    """Get historical accuracy of autonomous predictions"""
+    try:
+        accuracy = SmartPowerController.get_prediction_accuracy()
+        
+        return jsonify({
+            'status': 'success',
+            'data': accuracy
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/prediction/30-min', methods=['GET'])
+@rate_limit(max_requests=10, window_seconds=60)
+def predict_30_minutes():
+    """Predict campus load 30 minutes ahead for proactive source switching"""
+    try:
+        if not predictor.is_trained:
+            predictor.load_model()
+        
+        prediction, error = predictor.predict_30_minutes_ahead()
+        
+        if error:
+            return jsonify({'status': 'error', 'message': error}), 400
+        
+        return jsonify({
+            'status': 'success',
+            'data': prediction
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/prediction/room-occupancy', methods=['GET'])
+@rate_limit(max_requests=20, window_seconds=60)
+def get_room_occupancy_predictions():
+    """Get occupancy predictions for all scheduled rooms"""
+    try:
+        predictions = predictor.get_all_room_predictions()
+        
+        return jsonify({
+            'status': 'success',
+            'data': predictions
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/power/solar-status', methods=['GET'])
+def get_solar_status():
+    """Get current solar power availability and status"""
+    try:
+        current_hour = datetime.now().hour
+        solar_availability = SmartPowerController.get_solar_availability(current_hour)
+        
+        # Get all building configs
+        configs = PowerSourceConfig.query.all()
+        
+        buildings_status = []
+        for config in configs:
+            building = Building.query.get(config.building_id)
+            effective_capacity = config.solar_capacity_kw * solar_availability
+            
+            buildings_status.append({
+                'building_id': config.building_id,
+                'building_name': building.name if building else 'Unknown',
+                'solar_capacity_kw': config.solar_capacity_kw,
+                'effective_capacity_kw': round(effective_capacity, 2),
+                'current_output_kw': config.current_solar_output_kw,
+                'hybrid_mode_active': config.hybrid_mode_active,
+                'last_source_switch': config.last_source_switch.isoformat() if config.last_source_switch else None
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'current_hour': current_hour,
+                'solar_availability_factor': solar_availability,
+                'is_peak_solar': 6 <= current_hour < 18,
+                'is_evening': 18 <= current_hour < 20,
+                'is_night': current_hour >= 20 or current_hour < 6,
+                'buildings': buildings_status
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/power/hybrid-status', methods=['GET'])
+def get_hybrid_status():
+    """Get hybrid power mode status for all buildings"""
+    try:
+        configs = PowerSourceConfig.query.filter_by(hybrid_mode_active=True).all()
+        
+        hybrid_buildings = []
+        for config in configs:
+            building = Building.query.get(config.building_id)
+            hybrid_buildings.append({
+                'building_id': config.building_id,
+                'building_name': building.name if building else 'Unknown',
+                'solar_output_kw': config.current_solar_output_kw,
+                'grid_capacity_kw': config.grid_capacity_kw,
+                'activated_at': config.last_source_switch.isoformat() if config.last_source_switch else None
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'hybrid_buildings_count': len(hybrid_buildings),
+                'buildings': hybrid_buildings
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/autonomous/notifications', methods=['GET'])
+@rate_limit(max_requests=30, window_seconds=60)
+def get_autonomous_notifications():
+    """Get recent autonomous actions as notifications for dashboard"""
+    try:
+        minutes = request.args.get('minutes', default=10, type=int)
+        cutoff = datetime.now() - timedelta(minutes=minutes)
+        
+        logs = AutonomousLog.query.filter(
+            AutonomousLog.timestamp >= cutoff
+        ).order_by(AutonomousLog.timestamp.desc()).limit(20).all()
+        
+        notifications = []
+        for log in logs:
+            # Determine notification type/severity
+            if log.action_type == 'POWER_CUTOFF':
+                severity = 'warning'
+                icon = '🔌'
+            elif log.action_type == 'HYBRID_MODE':
+                severity = 'info'
+                icon = '⚡'
+            elif log.action_type == 'DEMAND_SPIKE':
+                severity = 'alert'
+                icon = '📈'
+            elif log.action_type == 'PREDICTIVE_SWITCH':
+                severity = 'info'
+                icon = '🔮'
+            else:
+                severity = 'info'
+                icon = 'ℹ️'
+            
+            room_name = log.room.name if log.room else None
+            building_name = log.building.name if log.building else None
+            
+            notifications.append({
+                'id': log.id,
+                'timestamp': log.timestamp.isoformat(),
+                'icon': icon,
+                'severity': severity,
+                'action_type': log.action_type,
+                'message': log.reason,
+                'room_name': room_name,
+                'building_name': building_name,
+                'energy_saved_kwh': log.energy_saved_kwh
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'notifications': notifications,
+                'count': len(notifications),
+                'period_minutes': minutes
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# ============================================================================
 # HEALTH CHECK
 # ============================================================================
 
@@ -1076,12 +1400,20 @@ def health_check():
         
         ml_status = 'not_initialized' if predictor is None else ('loaded' if predictor.is_trained else 'not_trained')
         
+        # Get autonomous system stats
+        auto_log_count = AutonomousLog.query.count()
+        risky_schedules_count = CancellationPattern.query.filter(
+            CancellationPattern.auto_cutoff_enabled == True
+        ).count()
+        
         return jsonify({
             'status': 'healthy',
             'timestamp': datetime.now().isoformat(),
             'database': 'connected',
             'rooms': room_count,
             'logs': log_count,
+            'autonomous_actions': auto_log_count,
+            'auto_cutoff_schedules': risky_schedules_count,
             'simulation': 'running',
             'ml_model': ml_status
         }), 200

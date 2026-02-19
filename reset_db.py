@@ -1,5 +1,8 @@
 from app import create_app
-from app.models import db, Building, Room, Floor, Faculty, Timetable, EnergySource, GridStatus, EnergyLog
+from app.models import (
+    db, Building, Room, Floor, Faculty, Timetable, EnergySource, 
+    GridStatus, EnergyLog, AutonomousLog, CancellationPattern, PowerSourceConfig
+)
 from app.utils.seed_data import seed_campus
 
 app = create_app()

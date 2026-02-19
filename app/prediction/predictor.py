@@ -242,3 +242,178 @@ class EnergyPredictor:
         feature_importance.sort(key=lambda x: x['importance'], reverse=True)
         
         return feature_importance, None
+    
+    def predict_30_minutes_ahead(self):
+        """
+        Predict campus load 30 minutes ahead for predictive source switching
+        Used by SmartPowerController for gradual transitions
+        """
+        if not self.is_trained:
+            if not self.load_model():
+                return None, "Model not trained"
+        
+        # Get latest data
+        latest_timestamp = db.session.query(db.func.max(EnergyLog.timestamp)).scalar()
+        
+        if not latest_timestamp:
+            return None, "No data available"
+        
+        latest_logs = EnergyLog.query.filter(
+            EnergyLog.timestamp == latest_timestamp
+        ).all()
+        
+        if not latest_logs:
+            return None, "No logs found"
+        
+        # Current state
+        total_load = sum(log.total_load for log in latest_logs)
+        avg_temp = np.mean([log.temperature for log in latest_logs])
+        occupancy_rate = sum(log.occupancy for log in latest_logs) / len(latest_logs)
+        
+        # 30 minutes ahead features
+        predict_time = latest_timestamp + timedelta(minutes=30)
+        hour = predict_time.hour
+        day_of_week = predict_time.weekday()
+        is_weekend = 1 if day_of_week >= 5 else 0
+        
+        features = pd.DataFrame([{
+            'hour': hour,
+            'day_of_week': day_of_week,
+            'is_weekend': is_weekend,
+            'avg_temperature': avg_temp,
+            'occupancy_rate': occupancy_rate,
+            'last_hour_load': total_load
+        }])
+        
+        predicted_load = self.model.predict(features)[0]
+        
+        # Calculate trend (increasing or decreasing)
+        load_change = predicted_load - total_load
+        trend = 'increasing' if load_change > 0.5 else ('decreasing' if load_change < -0.5 else 'stable')
+        
+        return {
+            'predicted_load_kw': round(predicted_load, 2),
+            'prediction_for': predict_time.isoformat(),
+            'current_load_kw': round(total_load, 2),
+            'load_change_kw': round(load_change, 2),
+            'trend': trend,
+            'prediction_window_minutes': 30
+        }, None
+    
+    def predict_room_occupancy(self, room_id, day_of_week=None, hour=None):
+        """
+        Predict if a specific room will be occupied based on historical patterns
+        Used for class cancellation prediction
+        """
+        from app.models import Timetable, CancellationPattern
+        
+        if day_of_week is None:
+            day_of_week = datetime.now().weekday()
+        if hour is None:
+            hour = datetime.now().hour
+        
+        # Check if room has scheduled class
+        scheduled = Timetable.query.filter(
+            Timetable.room_id == room_id,
+            Timetable.day_of_week == day_of_week
+        ).all()
+        
+        has_scheduled_class = False
+        for schedule in scheduled:
+            if schedule.start_time.hour <= hour < schedule.end_time.hour:
+                has_scheduled_class = True
+                break
+        
+        if not has_scheduled_class:
+            return {
+                'room_id': room_id,
+                'scheduled': False,
+                'predicted_occupied': False,
+                'confidence': 1.0,
+                'reason': 'No scheduled class'
+            }
+        
+        # Check cancellation pattern
+        pattern = CancellationPattern.query.filter_by(
+            room_id=room_id,
+            day_of_week=day_of_week,
+            hour=hour
+        ).first()
+        
+        if not pattern or pattern.scheduled_count < 5:
+            # Not enough data, assume occupied if scheduled
+            return {
+                'room_id': room_id,
+                'scheduled': True,
+                'predicted_occupied': True,
+                'confidence': 0.5,
+                'reason': 'Insufficient historical data, assuming occupied'
+            }
+        
+        # Predict based on historical cancellation rate
+        occupied_probability = 1 - pattern.cancellation_rate
+        predicted_occupied = occupied_probability >= 0.5
+        
+        return {
+            'room_id': room_id,
+            'scheduled': True,
+            'predicted_occupied': predicted_occupied,
+            'occupancy_probability': round(occupied_probability, 3),
+            'confidence': min(0.95, 0.5 + pattern.scheduled_count * 0.05),
+            'historical_cancellation_rate': round(pattern.cancellation_rate, 3),
+            'sample_count': pattern.scheduled_count,
+            'auto_cutoff_enabled': pattern.auto_cutoff_enabled
+        }
+    
+    def get_all_room_predictions(self):
+        """
+        Get occupancy predictions for all scheduled rooms
+        Returns list of rooms likely to be cancelled
+        """
+        from app.models import Room, Timetable
+        
+        current_time = datetime.now()
+        day_of_week = current_time.weekday()
+        hour = current_time.hour
+        
+        # Get all rooms with current schedules
+        scheduled_rooms = db.session.query(Room).join(Timetable).filter(
+            Timetable.day_of_week == day_of_week
+        ).distinct().all()
+        
+        predictions = []
+        likely_cancelled = []
+        
+        for room in scheduled_rooms:
+            # Check if current hour is within schedule
+            schedules = Timetable.query.filter_by(
+                room_id=room.id,
+                day_of_week=day_of_week
+            ).all()
+            
+            for schedule in schedules:
+                if schedule.start_time.hour <= hour < schedule.end_time.hour:
+                    prediction = self.predict_room_occupancy(room.id, day_of_week, hour)
+                    predictions.append({
+                        'room_id': room.id,
+                        'room_name': room.name,
+                        'room_type': room.type,
+                        **prediction
+                    })
+                    
+                    if not prediction.get('predicted_occupied', True):
+                        likely_cancelled.append({
+                            'room_id': room.id,
+                            'room_name': room.name,
+                            'room_type': room.type,
+                            'cancellation_probability': round(1 - prediction.get('occupancy_probability', 0.5), 3),
+                            'auto_cutoff_enabled': prediction.get('auto_cutoff_enabled', False)
+                        })
+        
+        return {
+            'timestamp': current_time.isoformat(),
+            'total_scheduled_rooms': len(predictions),
+            'likely_cancelled_count': len(likely_cancelled),
+            'predictions': predictions,
+            'likely_cancelled': sorted(likely_cancelled, key=lambda x: x['cancellation_probability'], reverse=True)
+        }

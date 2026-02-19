@@ -28,6 +28,19 @@ export const dashboardAPI = {
   getNextHourPrediction: () => api.get('/prediction/next-hour'),
   trainModel: (hoursBack = 168) => api.post('/prediction/train', { hours_back: hoursBack }),
   getModelInfo: () => api.get('/prediction/model-info'),
+  get30MinPrediction: () => api.get('/prediction/30-min'),
+  getRoomOccupancyPredictions: () => api.get('/prediction/room-occupancy'),
+  
+  // Autonomous System & Smart Power
+  getAutonomousLogs: (hours = 24, actionType, roomId, buildingId) => 
+    api.get('/autonomous/logs', { params: { hours, action_type: actionType, room_id: roomId, building_id: buildingId } }),
+  getRiskySchedules: (minRate = 0.5) => 
+    api.get('/autonomous/risky-schedules', { params: { min_rate: minRate } }),
+  getPredictionAccuracy: () => api.get('/autonomous/prediction-accuracy'),
+  getAutonomousNotifications: (minutes = 10) => 
+    api.get('/autonomous/notifications', { params: { minutes } }),
+  getSolarStatus: () => api.get('/power/solar-status'),
+  getHybridStatus: () => api.get('/power/hybrid-status'),
   
   // Campus Structure (old endpoints)
   getCampusStructure: () => api.get('/campus/structure'),

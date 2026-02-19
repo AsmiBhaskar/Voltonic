@@ -3,6 +3,8 @@ import { dashboardAPI } from '../api';
 import LiveData from './LiveData';
 import OptimizationMetrics from './OptimizationMetrics';
 import PredictionCard from './PredictionCard';
+import AutonomousActivity from './AutonomousActivity';
+import SolarStatus from './SolarStatus';
 
 function Dashboard() {
   const [dashboardData, setDashboardData] = useState(null);
@@ -44,13 +46,19 @@ function Dashboard() {
       {/* Live Campus Load */}
       <LiveData data={dashboardData?.campus_load} lastUpdated={dashboardData?.last_updated} />
       
-      <div className="grid-2">
+      <div className="grid-3">
         {/* Optimization Savings */}
         <OptimizationMetrics data={dashboardData?.optimization_savings} />
         
         {/* Next Hour Prediction */}
         <PredictionCard />
+        
+        {/* Solar & Power Status */}
+        <SolarStatus />
       </div>
+      
+      {/* Autonomous Activity Section */}
+      <AutonomousActivity />
     </div>
   );
 }
